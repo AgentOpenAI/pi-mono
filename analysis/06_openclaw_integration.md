@@ -62,7 +62,7 @@ graph TD
     subgraph "pi-mono (核心库)"
         SDK[Agent SDK]
         Runtime[Agent Runtime]
-        Tools[工具集 (Bash/FS)]
+        Tools["工具集 (Bash/FS)"]
     end
 
     UI --> Logic
