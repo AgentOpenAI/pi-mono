@@ -67,7 +67,7 @@
 classDiagram
     class StreamFunction {
         <<interface>>
-        (model, context) => AssistantMessageEventStream
+        +call(model, context) AssistantMessageEventStream
     }
 
     class ApiProvider {

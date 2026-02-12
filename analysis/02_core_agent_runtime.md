@@ -49,14 +49,14 @@ interface AgentTool<T> extends Tool<T> {
 sequenceDiagram
     participant User as 用户
     participant Agent as 智能体
-    participant Loop as AgentLoop (循环)
+    participant Loop as AgentLoop
     participant LLM as LLM模型
     participant Tool as 工具
 
     User->>Agent: prompt("修复这个Bug")
     Agent->>Loop: runLoop(messages)
 
-    loop Work Cycle (工作周期)
+    loop Work Cycle
         Loop->>LLM: Stream Response (发送历史)
         LLM-->>Loop: "我需要读取文件。" (ToolCall: read_file)
 
@@ -67,9 +67,9 @@ sequenceDiagram
         deactivate Tool
 
         Loop->>Agent: Check Steering Queue (检查干预队列)
-        alt User Interrupted (用户干预)
+        alt User Interrupted
             Agent->>Loop: Inject Steering Message (注入干预消息)
-        else No Interruption (无干预)
+        else No Interruption
             Loop->>Loop: Append Result to History (追加结果)
         end
     end
