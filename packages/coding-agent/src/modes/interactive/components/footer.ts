@@ -1,7 +1,8 @@
-import { type Component, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import type { AgentSession } from "../../../core/agent-session.js";
-import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
-import { theme } from "../theme/theme.js";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { AgentSession } from "../../../core/agent-session.ts";
+import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
+import { theme } from "../theme/theme.ts";
 
 /**
  * Sanitize text for display in a single-line status.
@@ -16,7 +17,7 @@ function sanitizeStatusText(text: string): string {
 }
 
 /**
- * Format token counts (similar to web-ui)
+ * Format token counts for compact footer display.
  */
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -26,17 +27,37 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+export function formatCwdForFooter(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const relativeToHome = relative(resolvedHome, resolvedCwd);
+	const isInsideHome =
+		relativeToHome === "" ||
+		(relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+
+	if (!isInsideHome) return cwd;
+	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+
 /**
  * Footer component that shows pwd, token stats, and context usage.
  * Computes token/context stats from session, gets git branch and extension statuses from provider.
  */
 export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
+	private session: AgentSession;
+	private footerData: ReadonlyFooterDataProvider;
 
-	constructor(
-		private session: AgentSession,
-		private footerData: ReadonlyFooterDataProvider,
-	) {}
+	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+		this.session = session;
+		this.footerData = footerData;
+	}
+
+	setSession(session: AgentSession): void {
+		this.session = session;
+	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
 		this.autoCompactEnabled = enabled;
@@ -67,6 +88,7 @@ export class FooterComponent implements Component {
 		let totalCacheRead = 0;
 		let totalCacheWrite = 0;
 		let totalCost = 0;
+		let latestCacheHitRate: number | undefined;
 
 		for (const entry of this.session.sessionManager.getEntries()) {
 			if (entry.type === "message" && entry.message.role === "assistant") {
@@ -75,6 +97,11 @@ export class FooterComponent implements Component {
 				totalCacheRead += entry.message.usage.cacheRead;
 				totalCacheWrite += entry.message.usage.cacheWrite;
 				totalCost += entry.message.usage.cost.total;
+
+				const latestPromptTokens =
+					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
+				latestCacheHitRate =
+					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
 			}
 		}
 
@@ -86,11 +113,7 @@ export class FooterComponent implements Component {
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
-		let pwd = process.cwd();
-		const home = process.env.HOME || process.env.USERPROFILE;
-		if (home && pwd.startsWith(home)) {
-			pwd = `~${pwd.slice(home.length)}`;
-		}
+		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
 
 		// Add git branch if available
 		const branch = this.footerData.getGitBranch();
@@ -104,24 +127,15 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} • ${sessionName}`;
 		}
 
-		// Truncate path if too long to fit width
-		if (pwd.length > width) {
-			const half = Math.floor(width / 2) - 2;
-			if (half > 1) {
-				const start = pwd.slice(0, half);
-				const end = pwd.slice(-(half - 1));
-				pwd = `${start}...${end}`;
-			} else {
-				pwd = pwd.slice(0, Math.max(1, width));
-			}
-		}
-
 		// Build stats line
 		const statsParts = [];
 		if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
 		if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
 		if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
 		if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
+		if ((totalCacheRead > 0 || totalCacheWrite > 0) && latestCacheHitRate !== undefined) {
+			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+		}
 
 		// Show cost with "(sub)" indicator if using OAuth subscription
 		const usingSubscription = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
@@ -155,9 +169,7 @@ export class FooterComponent implements Component {
 
 		// If statsLeft is too wide, truncate it
 		if (statsLeftWidth > width) {
-			// Truncate statsLeft to fit width (no room for right side)
-			const plainStatsLeft = statsLeft.replace(/\x1b\[[0-9;]*m/g, "");
-			statsLeft = `${plainStatsLeft.substring(0, width - 3)}...`;
+			statsLeft = truncateToWidth(statsLeft, width, "...");
 			statsLeftWidth = visibleWidth(statsLeft);
 		}
 
@@ -193,13 +205,11 @@ export class FooterComponent implements Component {
 		} else {
 			// Need to truncate right side
 			const availableForRight = width - statsLeftWidth - minPadding;
-			if (availableForRight > 3) {
-				// Truncate to fit (strip ANSI codes for length calculation, then truncate raw string)
-				const plainRightSide = rightSide.replace(/\x1b\[[0-9;]*m/g, "");
-				const truncatedPlain = plainRightSide.substring(0, availableForRight);
-				// For simplicity, just use plain truncated version (loses color, but fits)
-				const padding = " ".repeat(width - statsLeftWidth - truncatedPlain.length);
-				statsLine = statsLeft + padding + truncatedPlain;
+			if (availableForRight > 0) {
+				const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+				const truncatedRightWidth = visibleWidth(truncatedRight);
+				const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
+				statsLine = statsLeft + padding + truncatedRight;
 			} else {
 				// Not enough space for right side at all
 				statsLine = statsLeft;
@@ -213,7 +223,8 @@ export class FooterComponent implements Component {
 		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
 		const dimRemainder = theme.fg("dim", remainder);
 
-		const lines = [theme.fg("dim", pwd), dimStatsLeft + dimRemainder];
+		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
+		const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
 		// Add extension statuses on a single line, sorted by key alphabetically
 		const extensionStatuses = this.footerData.getExtensionStatuses();

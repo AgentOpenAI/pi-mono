@@ -1,4 +1,5 @@
-import { loadPhoton } from "./photon.js";
+import { applyExifOrientation } from "./exif-orientation.ts";
+import { loadPhoton } from "./photon.ts";
 
 /**
  * Convert image to PNG format for terminal display.
@@ -21,7 +22,9 @@ export async function convertToPng(
 
 	try {
 		const bytes = new Uint8Array(Buffer.from(base64Data, "base64"));
-		const image = photon.PhotonImage.new_from_byteslice(bytes);
+		const rawImage = photon.PhotonImage.new_from_byteslice(bytes);
+		const image = applyExifOrientation(photon, rawImage, bytes);
+		if (image !== rawImage) rawImage.free();
 		try {
 			const pngBuffer = image.get_bytes();
 			return {

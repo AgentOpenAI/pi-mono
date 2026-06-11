@@ -2,8 +2,8 @@
  * Shared utilities for compaction and branch summarization.
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Message } from "@earendil-works/pi-ai";
 
 // ============================================================================
 // File Operation Tracking
@@ -85,10 +85,26 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 // Message Serialization
 // ============================================================================
 
+/** Maximum characters for a tool result in serialized summaries. */
+const TOOL_RESULT_MAX_CHARS = 2000;
+
+/**
+ * Truncate text to a maximum character length for summarization.
+ * Keeps the beginning and appends a truncation marker.
+ */
+function truncateForSummary(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const truncatedChars = text.length - maxChars;
+	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+}
+
 /**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.
  * Call convertToLlm() first to handle custom message types.
+ *
+ * Tool results are truncated to keep the summarization request within
+ * reasonable token budgets. Full content is not needed for summarization.
  */
 export function serializeConversation(messages: Message[]): string {
 	const parts: string[] = [];
@@ -137,7 +153,7 @@ export function serializeConversation(messages: Message[]): string {
 				.map((c) => c.text)
 				.join("");
 			if (content) {
-				parts.push(`[Tool result]: ${content}`);
+				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
 			}
 		}
 	}
@@ -149,6 +165,6 @@ export function serializeConversation(messages: Message[]): string {
 // Summarization System Prompt
 // ============================================================================
 
-export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
+export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;

@@ -1,17 +1,26 @@
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { Transport } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Transport } from "@earendil-works/pi-ai";
 import {
 	Container,
 	getCapabilities,
 	type SelectItem,
 	SelectList,
+	type SelectListLayoutOptions,
 	type SettingItem,
 	SettingsList,
 	Spacer,
 	Text,
-} from "@mariozechner/pi-tui";
-import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
+} from "@earendil-works/pi-tui";
+import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
+import type { DefaultProjectTrust, WarningSettings } from "../../../core/settings-manager.ts";
+import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.ts";
+import { DynamicBorder } from "./dynamic-border.ts";
+import { keyDisplayText } from "./keybinding-hints.ts";
+
+const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
+	minPrimaryColumnWidth: 12,
+	maxPrimaryColumnWidth: 32,
+};
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -22,55 +31,121 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	xhigh: "Maximum reasoning (~32k tokens)",
 };
 
+const DEFAULT_PROJECT_TRUST_LABELS: Record<DefaultProjectTrust, string> = {
+	ask: "Ask",
+	always: "Always trust",
+	never: "Never trust",
+};
+
+const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
+	Object.entries(DEFAULT_PROJECT_TRUST_LABELS).map(([value, label]) => [label, value as DefaultProjectTrust]),
+);
+
 export interface SettingsConfig {
 	autoCompact: boolean;
 	showImages: boolean;
+	imageWidthCells: number;
 	autoResizeImages: boolean;
 	blockImages: boolean;
 	enableSkillCommands: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
+	httpIdleTimeoutMs: number;
 	thinkingLevel: ThinkingLevel;
 	availableThinkingLevels: ThinkingLevel[];
 	currentTheme: string;
 	availableThemes: string[];
 	hideThinkingBlock: boolean;
 	collapseChangelog: boolean;
+	enableInstallTelemetry: boolean;
 	doubleEscapeAction: "fork" | "tree" | "none";
+	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
 	autocompleteMaxVisible: number;
 	quietStartup: boolean;
+	defaultProjectTrust: DefaultProjectTrust;
 	clearOnShrink: boolean;
+	showTerminalProgress: boolean;
+	warnings: WarningSettings;
 }
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
 	onShowImagesChange: (enabled: boolean) => void;
+	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
 	onBlockImagesChange: (blocked: boolean) => void;
 	onEnableSkillCommandsChange: (enabled: boolean) => void;
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
+	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
 	onThinkingLevelChange: (level: ThinkingLevel) => void;
 	onThemeChange: (theme: string) => void;
 	onThemePreview?: (theme: string) => void;
 	onHideThinkingBlockChange: (hidden: boolean) => void;
 	onCollapseChangelogChange: (collapsed: boolean) => void;
+	onEnableInstallTelemetryChange: (enabled: boolean) => void;
 	onDoubleEscapeActionChange: (action: "fork" | "tree" | "none") => void;
+	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
 	onAutocompleteMaxVisibleChange: (maxVisible: number) => void;
 	onQuietStartupChange: (enabled: boolean) => void;
+	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
+	onShowTerminalProgressChange: (enabled: boolean) => void;
+	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
 }
 
 /**
  * A submenu component for selecting from a list of options.
  */
+class WarningSettingsSubmenu extends Container {
+	private settingsList: SettingsList;
+	private state: WarningSettings;
+
+	constructor(warnings: WarningSettings, onChange: (warnings: WarningSettings) => void, onCancel: () => void) {
+		super();
+
+		this.state = { ...warnings };
+
+		const items: SettingItem[] = [
+			{
+				id: "anthropic-extra-usage",
+				label: "Anthropic extra usage",
+				description: "Warn when Anthropic subscription auth may use paid extra usage",
+				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
+				values: ["true", "false"],
+			},
+		];
+
+		this.settingsList = new SettingsList(
+			items,
+			Math.min(items.length, 10),
+			getSettingsListTheme(),
+			(id, newValue) => {
+				switch (id) {
+					case "anthropic-extra-usage":
+						this.state = { ...this.state, anthropicExtraUsage: newValue === "true" };
+						onChange({ ...this.state });
+						break;
+				}
+			},
+			onCancel,
+		);
+
+		this.addChild(this.settingsList);
+	}
+
+	handleInput(data: string): void {
+		this.settingsList.handleInput(data);
+	}
+}
+
 class SelectSubmenu extends Container {
 	private selectList: SelectList;
 
@@ -98,7 +173,12 @@ class SelectSubmenu extends Container {
 		this.addChild(new Spacer(1));
 
 		// Select list
-		this.selectList = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
+		this.selectList = new SelectList(
+			options,
+			Math.min(options.length, 10),
+			getSelectListTheme(),
+			SETTINGS_SUBMENU_SELECT_LIST_LAYOUT,
+		);
 
 		// Pre-select current value
 		const currentIndex = options.findIndex((o) => o.value === currentValue);
@@ -140,6 +220,8 @@ export class SettingsSelectorComponent extends Container {
 		super();
 
 		const supportsImages = getCapabilities().images;
+		const followUpKey = keyDisplayText("app.message.followUp");
+		let currentWarnings = { ...config.warnings };
 
 		const items: SettingItem[] = [
 			{
@@ -160,8 +242,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "follow-up-mode",
 				label: "Follow-up mode",
-				description:
-					"Alt+Enter queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+				description: `${followUpKey} queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.`,
 				currentValue: config.followUpMode,
 				values: ["one-at-a-time", "all"],
 			},
@@ -170,7 +251,15 @@ export class SettingsSelectorComponent extends Container {
 				label: "Transport",
 				description: "Preferred transport for providers that support multiple transports",
 				currentValue: config.transport,
-				values: ["sse", "websocket", "auto"],
+				values: ["sse", "websocket", "websocket-cached", "auto"],
+			},
+			{
+				id: "http-idle-timeout",
+				label: "HTTP idle timeout",
+				description:
+					"Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that pause longer than five minutes.",
+				currentValue: formatHttpIdleTimeoutMs(config.httpIdleTimeoutMs),
+				values: HTTP_IDLE_TIMEOUT_CHOICES.map((choice) => choice.label),
 			},
 			{
 				id: "hide-thinking",
@@ -194,11 +283,47 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "install-telemetry",
+				label: "Install telemetry",
+				description: "Send an anonymous version/update ping after changelog-detected updates",
+				currentValue: config.enableInstallTelemetry ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
+				id: "default-project-trust",
+				label: "Default project trust",
+				description: "Fallback behavior when no extension or saved trust decision decides project trust",
+				currentValue: DEFAULT_PROJECT_TRUST_LABELS[config.defaultProjectTrust],
+				values: Object.values(DEFAULT_PROJECT_TRUST_LABELS),
+			},
+			{
 				id: "double-escape-action",
 				label: "Double-escape action",
 				description: "Action when pressing Escape twice with empty editor",
 				currentValue: config.doubleEscapeAction,
 				values: ["tree", "fork", "none"],
+			},
+			{
+				id: "tree-filter-mode",
+				label: "Tree filter mode",
+				description: "Default filter when opening /tree",
+				currentValue: config.treeFilterMode,
+				values: ["default", "no-tools", "user-only", "labeled-only", "all"],
+			},
+			{
+				id: "warnings",
+				label: "Warnings",
+				description: "Enable or disable individual warnings",
+				currentValue: "configure",
+				submenu: (_currentValue, done) =>
+					new WarningSettingsSubmenu(
+						currentWarnings,
+						(warnings) => {
+							currentWarnings = warnings;
+							callbacks.onWarningsChange(warnings);
+						},
+						() => done(),
+					),
 			},
 			{
 				id: "thinking",
@@ -263,10 +388,17 @@ export class SettingsSelectorComponent extends Container {
 				currentValue: config.showImages ? "true" : "false",
 				values: ["true", "false"],
 			});
+			items.splice(2, 0, {
+				id: "image-width-cells",
+				label: "Image width",
+				description: "Preferred inline image width in terminal cells",
+				currentValue: String(config.imageWidthCells),
+				values: ["60", "80", "120"],
+			});
 		}
 
 		// Image auto-resize toggle (always available, affects both attached and read images)
-		items.splice(supportsImages ? 2 : 1, 0, {
+		items.splice(supportsImages ? 3 : 1, 0, {
 			id: "auto-resize-images",
 			label: "Auto-resize images",
 			description: "Resize large images to 2000x2000 max for better model compatibility",
@@ -334,6 +466,16 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
+		// Terminal progress toggle (insert after clear-on-shrink)
+		const clearOnShrinkIndex = items.findIndex((item) => item.id === "clear-on-shrink");
+		items.splice(clearOnShrinkIndex + 1, 0, {
+			id: "terminal-progress",
+			label: "Terminal progress",
+			description: "Show OSC 9;4 progress indicators in the terminal tab bar",
+			currentValue: config.showTerminalProgress ? "true" : "false",
+			values: ["true", "false"],
+		});
+
 		// Add borders
 		this.addChild(new DynamicBorder());
 
@@ -348,6 +490,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");
+						break;
+					case "image-width-cells":
+						callbacks.onImageWidthCellsChange(parseInt(newValue, 10));
 						break;
 					case "auto-resize-images":
 						callbacks.onAutoResizeImagesChange(newValue === "true");
@@ -367,6 +512,13 @@ export class SettingsSelectorComponent extends Container {
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);
 						break;
+					case "http-idle-timeout": {
+						const choice = HTTP_IDLE_TIMEOUT_CHOICES.find((item) => item.label === newValue);
+						if (choice) {
+							callbacks.onHttpIdleTimeoutMsChange(choice.timeoutMs);
+						}
+						break;
+					}
 					case "hide-thinking":
 						callbacks.onHideThinkingBlockChange(newValue === "true");
 						break;
@@ -376,8 +528,23 @@ export class SettingsSelectorComponent extends Container {
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "true");
 						break;
+					case "install-telemetry":
+						callbacks.onEnableInstallTelemetryChange(newValue === "true");
+						break;
+					case "default-project-trust": {
+						const defaultProjectTrust = DEFAULT_PROJECT_TRUST_BY_LABEL.get(newValue);
+						if (defaultProjectTrust) {
+							callbacks.onDefaultProjectTrustChange(defaultProjectTrust);
+						}
+						break;
+					}
 					case "double-escape-action":
 						callbacks.onDoubleEscapeActionChange(newValue as "fork" | "tree");
+						break;
+					case "tree-filter-mode":
+						callbacks.onTreeFilterModeChange(
+							newValue as "default" | "no-tools" | "user-only" | "labeled-only" | "all",
+						);
 						break;
 					case "show-hardware-cursor":
 						callbacks.onShowHardwareCursorChange(newValue === "true");
@@ -390,6 +557,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "clear-on-shrink":
 						callbacks.onClearOnShrinkChange(newValue === "true");
+						break;
+					case "terminal-progress":
+						callbacks.onShowTerminalProgressChange(newValue === "true");
 						break;
 				}
 			},

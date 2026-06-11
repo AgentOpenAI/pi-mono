@@ -1,13 +1,19 @@
 /**
- * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
+ * Shared utilities for Google Generative AI and Google Vertex providers.
  */
 
 import { type Content, FinishReason, FunctionCallingConfigMode, type Part } from "@google/genai";
-import type { Context, ImageContent, Model, StopReason, TextContent, Tool } from "../types.js";
-import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { transformMessages } from "./transform-messages.js";
+import type { Context, ImageContent, Model, StopReason, TextContent, Tool } from "../types.ts";
+import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { transformMessages } from "./transform-messages.ts";
 
-type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
+type GoogleApiType = "google-generative-ai" | "google-vertex";
+
+/**
+ * Thinking level for Gemini 3 models.
+ * Mirrors Google's ThinkingLevel enum values.
+ */
+export type GoogleThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
 
 /**
  * Determines whether a streamed Gemini `Part` should be treated as "thinking".
@@ -65,6 +71,20 @@ export function requiresToolCallId(modelId: string): boolean {
 	return modelId.startsWith("claude-") || modelId.startsWith("gpt-oss-");
 }
 
+function getGeminiMajorVersion(modelId: string): number | undefined {
+	const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
+	if (!match) return undefined;
+	return Number.parseInt(match[1], 10);
+}
+
+function supportsMultimodalFunctionResponse(modelId: string): boolean {
+	const geminiMajorVersion = getGeminiMajorVersion(modelId);
+	if (geminiMajorVersion !== undefined) {
+		return geminiMajorVersion >= 3;
+	}
+	return true;
+}
+
 /**
  * Convert internal messages to Gemini Content[] format.
  */
@@ -97,11 +117,10 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						};
 					}
 				});
-				const filteredParts = !model.input.includes("image") ? parts.filter((p) => p.text !== undefined) : parts;
-				if (filteredParts.length === 0) continue;
+				if (parts.length === 0) continue;
 				contents.push({
 					role: "user",
-					parts: filteredParts,
+					parts,
 				});
 			}
 		} else if (msg.role === "assistant") {
@@ -111,7 +130,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 
 			for (const block of msg.content) {
 				if (block.type === "text") {
-					// Skip empty text blocks - they can cause issues with some models (e.g. Claude via Antigravity)
+					// Skip empty text blocks
 					if (!block.text || block.text.trim() === "") continue;
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.textSignature);
 					parts.push({
@@ -137,29 +156,15 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					}
 				} else if (block.type === "toolCall") {
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
-					// Gemini 3 requires thoughtSignature on all function calls when thinking mode is enabled.
-					// When replaying history from providers without thought signatures (e.g. Claude via Antigravity),
-					// convert unsigned function calls to text to avoid API validation errors.
-					// We include a note telling the model this is historical context to prevent mimicry.
-					const isGemini3 = model.id.toLowerCase().includes("gemini-3");
-					if (isGemini3 && !thoughtSignature) {
-						const argsStr = JSON.stringify(block.arguments ?? {}, null, 2);
-						parts.push({
-							text: `[Historical context: a different model called tool "${block.name}" with arguments: ${argsStr}. Do not mimic this format - use proper function calling.]`,
-						});
-					} else {
-						const part: Part = {
-							functionCall: {
-								name: block.name,
-								args: block.arguments ?? {},
-								...(requiresToolCallId(model.id) ? { id: block.id } : {}),
-							},
-						};
-						if (thoughtSignature) {
-							part.thoughtSignature = thoughtSignature;
-						}
-						parts.push(part);
-					}
+					const part: Part = {
+						functionCall: {
+							name: block.name,
+							args: block.arguments ?? {},
+							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+						},
+						...(thoughtSignature && { thoughtSignature }),
+					};
+					parts.push(part);
 				}
 			}
 
@@ -179,10 +184,10 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 			const hasText = textResult.length > 0;
 			const hasImages = imageContent.length > 0;
 
-			// Gemini 3 supports multimodal function responses with images nested inside functionResponse.parts
-			// See: https://ai.google.dev/gemini-api/docs/function-calling#multimodal
-			// Older models don't support this, so we put images in a separate user message.
-			const supportsMultimodalFunctionResponse = model.id.includes("gemini-3");
+			// Gemini 3+ models support multimodal function responses with images nested inside
+			// functionResponse.parts. Claude and other non-Gemini models behind Cloud Code Assist /
+			// Gemini < 3 still needs a separate user image turn.
+			const modelSupportsMultimodalFunctionResponse = supportsMultimodalFunctionResponse(model.id);
 
 			// Use "output" key for success, "error" key for errors as per SDK documentation
 			const responseValue = hasText ? sanitizeSurrogates(textResult) : hasImages ? "(see attached image)" : "";
@@ -199,8 +204,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				functionResponse: {
 					name: msg.toolName,
 					response: msg.isError ? { error: responseValue } : { output: responseValue },
-					// Nest images inside functionResponse.parts for Gemini 3
-					...(hasImages && supportsMultimodalFunctionResponse && { parts: imageParts }),
+					...(hasImages && modelSupportsMultimodalFunctionResponse && { parts: imageParts }),
 					...(includeId ? { id: msg.toolCallId } : {}),
 				},
 			};
@@ -217,8 +221,8 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				});
 			}
 
-			// For older models, add images in a separate user message
-			if (hasImages && !supportsMultimodalFunctionResponse) {
+			// For Gemini < 3, add images in a separate user message
+			if (hasImages && !modelSupportsMultimodalFunctionResponse) {
 				contents.push({
 					role: "user",
 					parts: [{ text: "Tool result image:" }, ...imageParts],
@@ -228,6 +232,33 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 	}
 
 	return contents;
+}
+
+const JSON_SCHEMA_META_DECLARATIONS = new Set([
+	"$schema",
+	"$id",
+	"$anchor",
+	"$dynamicAnchor",
+	"$vocabulary",
+	"$comment",
+	"$defs",
+	"definitions", // pre-draft-2019-09 equivalent of $defs
+]);
+
+/**
+ * Strip meta-declarations from a schema obj
+ */
+function sanitizeForOpenApi(schema: unknown): unknown {
+	if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+		return schema;
+	}
+
+	const result: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema)) {
+		if (JSON_SCHEMA_META_DECLARATIONS.has(key)) continue;
+		result[key] = sanitizeForOpenApi(value);
+	}
+	return result;
 }
 
 /**
@@ -248,7 +279,9 @@ export function convertTools(
 			functionDeclarations: tools.map((tool) => ({
 				name: tool.name,
 				description: tool.description,
-				...(useParameters ? { parameters: tool.parameters } : { parametersJsonSchema: tool.parameters }),
+				...(useParameters
+					? { parameters: sanitizeForOpenApi(tool.parameters as unknown) }
+					: { parametersJsonSchema: tool.parameters }),
 			})),
 		},
 	];

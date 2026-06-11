@@ -2,9 +2,10 @@
  * GitHub Copilot OAuth flow
  */
 
-import { getModels } from "../../models.js";
-import type { Api, Model } from "../../types.js";
-import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
+import { getModels } from "../../models.ts";
+import type { Api, Model } from "../../types.ts";
+import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
+import type { OAuthCredentials, OAuthDeviceCodeInfo, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.ts";
 
 type CopilotCredentials = OAuthCredentials & {
 	enterpriseUrl?: string;
@@ -24,7 +25,7 @@ type DeviceCodeResponse = {
 	device_code: string;
 	user_code: string;
 	verification_uri: string;
-	interval: number;
+	interval?: number;
 	expires_in: number;
 };
 
@@ -37,7 +38,6 @@ type DeviceTokenSuccessResponse = {
 type DeviceTokenErrorResponse = {
 	error: string;
 	error_description?: string;
-	interval?: number;
 };
 
 export function normalizeDomain(input: string): string | null {
@@ -103,10 +103,10 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
-			"Content-Type": "application/json",
+			"Content-Type": "application/x-www-form-urlencoded",
 			"User-Agent": "GitHubCopilotChat/0.35.0",
 		},
-		body: JSON.stringify({
+		body: new URLSearchParams({
 			client_id: CLIENT_ID,
 			scope: "read:user",
 		}),
@@ -126,98 +126,79 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		typeof deviceCode !== "string" ||
 		typeof userCode !== "string" ||
 		typeof verificationUri !== "string" ||
-		typeof interval !== "number" ||
+		(interval !== undefined && typeof interval !== "number") ||
 		typeof expiresIn !== "number"
 	) {
 		throw new Error("Invalid device code response fields");
 	}
 
+	// The verification URI is opened in the user's browser and to prevent `open` from
+	// opening an executable or similar, we force it to be a URL.
+	let parsedUri: URL;
+	try {
+		parsedUri = new URL(verificationUri);
+	} catch {
+		throw new Error("Untrusted verification_uri in device code response");
+	}
+	if (parsedUri.protocol !== "https:" && parsedUri.protocol !== "http:") {
+		throw new Error("Untrusted verification_uri in device code response");
+	}
+
 	return {
 		device_code: deviceCode,
 		user_code: userCode,
-		verification_uri: verificationUri,
+		verification_uri: parsedUri.href,
 		interval,
 		expires_in: expiresIn,
 	};
 }
 
-/**
- * Sleep that can be interrupted by an AbortSignal
- */
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Login cancelled"));
-			return;
-		}
-
-		const timeout = setTimeout(resolve, ms);
-
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new Error("Login cancelled"));
-			},
-			{ once: true },
-		);
-	});
-}
-
 async function pollForGitHubAccessToken(
 	domain: string,
-	deviceCode: string,
-	intervalSeconds: number,
-	expiresIn: number,
+	device: DeviceCodeResponse,
 	signal?: AbortSignal,
-) {
+): Promise<string> {
 	const urls = getUrls(domain);
-	const deadline = Date.now() + expiresIn * 1000;
-	let intervalMs = Math.max(1000, Math.floor(intervalSeconds * 1000));
+	return pollOAuthDeviceCodeFlow<string>({
+		intervalSeconds: device.interval,
+		expiresInSeconds: device.expires_in,
+		signal,
+		poll: async () => {
+			const raw = await fetchJson(urls.accessTokenUrl, {
+				method: "POST",
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": "GitHubCopilotChat/0.35.0",
+				},
+				body: new URLSearchParams({
+					client_id: CLIENT_ID,
+					device_code: device.device_code,
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+				}),
+			});
 
-	while (Date.now() < deadline) {
-		if (signal?.aborted) {
-			throw new Error("Login cancelled");
-		}
-
-		const raw = await fetchJson(urls.accessTokenUrl, {
-			method: "POST",
-			headers: {
-				Accept: "application/json",
-				"Content-Type": "application/json",
-				"User-Agent": "GitHubCopilotChat/0.35.0",
-			},
-			body: JSON.stringify({
-				client_id: CLIENT_ID,
-				device_code: deviceCode,
-				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-			}),
-		});
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
-			return (raw as DeviceTokenSuccessResponse).access_token;
-		}
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-			const err = (raw as DeviceTokenErrorResponse).error;
-			if (err === "authorization_pending") {
-				await abortableSleep(intervalMs, signal);
-				continue;
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
+				return { status: "complete", value: (raw as DeviceTokenSuccessResponse).access_token };
 			}
 
-			if (err === "slow_down") {
-				intervalMs += 5000;
-				await abortableSleep(intervalMs, signal);
-				continue;
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
+				const { error, error_description: description } = raw as DeviceTokenErrorResponse;
+				if (error === "authorization_pending") {
+					return { status: "pending" };
+				}
+
+				if (error === "slow_down") {
+					return { status: "slow_down" };
+				}
+
+				const descriptionSuffix = description ? `: ${description}` : "";
+				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
 			}
 
-			throw new Error(`Device flow failed: ${err}`);
-		}
-
-		await abortableSleep(intervalMs, signal);
-	}
-
-	throw new Error("Device flow timed out");
+			return { status: "failed", message: "Invalid device token response" };
+		},
+	});
 }
 
 /**
@@ -304,13 +285,13 @@ async function enableAllGitHubCopilotModels(
 /**
  * Login with GitHub Copilot OAuth (device code flow)
  *
- * @param options.onAuth - Callback with URL and optional instructions (user code)
+ * @param options.onDeviceCode - Callback with URL and user code
  * @param options.onPrompt - Callback to prompt user for input
  * @param options.onProgress - Optional progress callback
  * @param options.signal - Optional AbortSignal for cancellation
  */
 export async function loginGitHubCopilot(options: {
-	onAuth: (url: string, instructions?: string) => void;
+	onDeviceCode: (info: OAuthDeviceCodeInfo) => void;
 	onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 	onProgress?: (message: string) => void;
 	signal?: AbortSignal;
@@ -333,15 +314,14 @@ export async function loginGitHubCopilot(options: {
 	const domain = enterpriseDomain || "github.com";
 
 	const device = await startDeviceFlow(domain);
-	options.onAuth(device.verification_uri, `Enter code: ${device.user_code}`);
+	options.onDeviceCode({
+		userCode: device.user_code,
+		verificationUri: device.verification_uri,
+		intervalSeconds: device.interval,
+		expiresInSeconds: device.expires_in,
+	});
 
-	const githubAccessToken = await pollForGitHubAccessToken(
-		domain,
-		device.device_code,
-		device.interval,
-		device.expires_in,
-		options.signal,
-	);
+	const githubAccessToken = await pollForGitHubAccessToken(domain, device, options.signal);
 	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
 
 	// Enable all models after successful login
@@ -356,7 +336,7 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 
 	async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 		return loginGitHubCopilot({
-			onAuth: (url, instructions) => callbacks.onAuth({ url, instructions }),
+			onDeviceCode: callbacks.onDeviceCode,
 			onPrompt: callbacks.onPrompt,
 			onProgress: callbacks.onProgress,
 			signal: callbacks.signal,

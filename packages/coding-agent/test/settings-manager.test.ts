@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -155,7 +157,7 @@ describe("SettingsManager", () => {
 	});
 
 	describe("reload", () => {
-		it("should reload global settings from disk", () => {
+		it("should reload global settings from disk", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(
 				settingsPath,
@@ -176,21 +178,21 @@ describe("SettingsManager", () => {
 				}),
 			);
 
-			manager.reload();
+			await manager.reload();
 
 			expect(manager.getTheme()).toBe("light");
 			expect(manager.getExtensionPaths()).toEqual(["/after.ts"]);
 			expect(manager.getDefaultModel()).toBe("claude-sonnet");
 		});
 
-		it("should keep previous settings when file is invalid", () => {
+		it("should keep previous settings when file is invalid", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 
 			writeFileSync(settingsPath, "{ invalid json");
-			manager.reload();
+			await manager.reload();
 
 			expect(manager.getTheme()).toBe("dark");
 		});
@@ -209,6 +211,61 @@ describe("SettingsManager", () => {
 			expect(errors).toHaveLength(2);
 			expect(errors.map((e) => e.scope).sort()).toEqual(["global", "project"]);
 			expect(manager.drainErrors()).toEqual([]);
+		});
+	});
+
+	describe("project trust", () => {
+		it("should skip project settings when project is not trusted", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "global" }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: "project" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
+
+			expect(manager.isProjectTrusted()).toBe(false);
+			expect(manager.getTheme()).toBe("global");
+			expect(manager.getProjectSettings()).toEqual({});
+		});
+
+		it("should reload project settings after trust changes to true", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "global" }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: "project" }));
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
+
+			manager.setProjectTrusted(true);
+
+			expect(manager.isProjectTrusted()).toBe(true);
+			expect(manager.getTheme()).toBe("project");
+		});
+
+		it("should fail project settings writes when project is not trusted", async () => {
+			const projectSettingsPath = join(projectDir, ".pi", "settings.json");
+			writeFileSync(projectSettingsPath, JSON.stringify({ packages: ["npm:existing"] }));
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
+
+			expect(() => manager.setProjectPackages(["npm:new"])).toThrow(
+				"Project is not trusted; refusing to write project settings",
+			);
+			await manager.flush();
+
+			expect(manager.getProjectSettings()).toEqual({});
+			expect(JSON.parse(readFileSync(projectSettingsPath, "utf-8"))).toEqual({ packages: ["npm:existing"] });
+		});
+
+		it("should read default project trust from global settings only", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: "always" }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ defaultProjectTrust: "never" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getDefaultProjectTrust()).toBe("always");
+		});
+
+		it("should default invalid project trust settings to ask", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: "sometimes" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getDefaultProjectTrust()).toBe("ask");
 		});
 	});
 
@@ -256,6 +313,29 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("httpIdleTimeoutMs", () => {
+		it("should default to 5 minutes", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getHttpIdleTimeoutMs()).toBe(DEFAULT_HTTP_IDLE_TIMEOUT_MS);
+		});
+
+		it("should use merged global and project settings", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ httpIdleTimeoutMs: 300000 }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ httpIdleTimeoutMs: 0 }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getHttpIdleTimeoutMs()).toBe(0);
+		});
+
+		it("should reject invalid timeout values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ httpIdleTimeoutMs: -1 }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(() => manager.getHttpIdleTimeoutMs()).toThrow("Invalid httpIdleTimeoutMs setting");
+		});
+	});
+
 	describe("shellCommandPrefix", () => {
 		it("should load shellCommandPrefix from settings", () => {
 			const settingsPath = join(agentDir, "settings.json");
@@ -286,6 +366,33 @@ describe("SettingsManager", () => {
 			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
 			expect(savedSettings.shellCommandPrefix).toBe("shopt -s expand_aliases");
 			expect(savedSettings.theme).toBe("light");
+		});
+	});
+
+	describe("getSessionDir", () => {
+		it("should return undefined when not set", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSessionDir()).toBeUndefined();
+		});
+
+		it("should return global sessionDir", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "/tmp/sessions" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSessionDir()).toBe("/tmp/sessions");
+		});
+
+		it("should return project sessionDir, overriding global", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "/global/sessions" }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ sessionDir: "./sessions" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSessionDir()).toBe("./sessions");
+		});
+
+		it("should expand ~ in sessionDir", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "~/sessions" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
 		});
 	});
 });
